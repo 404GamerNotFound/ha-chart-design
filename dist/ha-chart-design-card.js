@@ -21,6 +21,30 @@ const THRESHOLD_PRESETS = {
   ]
 };
 
+let CHART_JS_LOAD_PROMISE = null;
+
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+
+const escapeAttribute = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const clampInt = (value, fallback, min, max) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+};
+
 const parseEntityList = (raw) => {
   if (Array.isArray(raw)) {
     return raw.map((item) => `${item}`.trim()).filter(Boolean);
@@ -51,20 +75,22 @@ const parseThresholds = (rawThresholds) => {
     .sort((a, b) => a.value - b.value);
 };
 
-const parseThresholdsFromText = (text) => `${text || ""}`
-  .split(/\r?\n/)
-  .map((line) => line.trim())
-  .filter(Boolean)
-  .map((line) => {
-    const [valueRaw, colorRaw] = line.split(",").map((part) => part.trim());
-    const value = Number.parseFloat(valueRaw);
-    if (Number.isNaN(value) || !colorRaw) return null;
-    return { value, color: colorRaw };
-  })
-  .filter(Boolean)
-  .sort((a, b) => a.value - b.value);
+const parseThresholdsFromText = (text) =>
+  `${text || ""}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [valueRaw, colorRaw] = line.split(",").map((part) => part.trim());
+      const value = Number.parseFloat(valueRaw);
+      if (Number.isNaN(value) || !colorRaw) return null;
+      return { value, color: colorRaw };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.value - b.value);
 
-const formatThresholdsForText = (thresholds) => thresholds.map((entry) => `${entry.value}, ${entry.color}`).join("\n");
+const formatThresholdsForText = (thresholds) =>
+  (thresholds || []).map((entry) => `${entry.value}, ${entry.color}`).join("\n");
 
 const getPresetThresholds = (preset) => {
   const presetEntries = THRESHOLD_PRESETS[preset] || [];
@@ -79,15 +105,20 @@ const normalizeConfig = (config) => {
 
   return {
     title: "HA Chart Design",
-    hours_to_show: 24,
-    max_samples: 200,
-    fill: false,
-    line_width: 2,
-    colors: [],
-    threshold_preset: "none",
-    thresholds: [],
+    hours_to_show: clampInt(config.hours_to_show, 24, 1, 24 * 30),
+    max_samples: clampInt(config.max_samples, 200, 10, 5000),
+    fill: Boolean(config.fill),
+    line_width: clampInt(config.line_width, 2, 1, 8),
+    colors: Array.isArray(config.colors) ? config.colors.map((c) => `${c}`.trim()).filter(Boolean) : [],
+    threshold_preset: thresholdPreset,
+    thresholds,
     ...config,
     entities,
+    hours_to_show: clampInt(config.hours_to_show, 24, 1, 24 * 30),
+    max_samples: clampInt(config.max_samples, 200, 10, 5000),
+    fill: Boolean(config.fill),
+    line_width: clampInt(config.line_width, 2, 1, 8),
+    colors: Array.isArray(config.colors) ? config.colors.map((c) => `${c}`.trim()).filter(Boolean) : [],
     threshold_preset: thresholdPreset,
     thresholds
   };
@@ -139,8 +170,10 @@ class HaChartDesignCard extends HTMLElement {
     this._config = null;
     this._hass = null;
     this._chart = null;
-    this._chartPromise = null;
     this._canvas = null;
+    this._updateTimer = null;
+    this._updateRequestId = 0;
+    this._lastRelevantStateSignature = "";
   }
 
   setConfig(config) {
@@ -151,35 +184,109 @@ class HaChartDesignCard extends HTMLElement {
     }
 
     this._config = normalized;
+    this._lastRelevantStateSignature = "";
     this._renderSkeleton();
+    this._scheduleUpdate(0);
   }
 
   set hass(hass) {
     this._hass = hass;
     if (!this._config) return;
-    this._update();
+
+    const signature = this._getRelevantStateSignature();
+    if (signature === this._lastRelevantStateSignature && this._chart) {
+      return;
+    }
+
+    this._lastRelevantStateSignature = signature;
+    this._scheduleUpdate(150);
+  }
+
+  disconnectedCallback() {
+    if (this._updateTimer) {
+      clearTimeout(this._updateTimer);
+      this._updateTimer = null;
+    }
+
+    if (this._chart) {
+      this._chart.destroy();
+      this._chart = null;
+    }
   }
 
   getCardSize() {
     return 4;
   }
 
+  _getRelevantStateSignature() {
+    if (!this._hass || !this._config?.entities?.length) return "";
+
+    return this._config.entities
+      .map((entityId) => {
+        const stateObj = this._hass.states?.[entityId];
+        if (!stateObj) return `${entityId}|missing`;
+        return `${entityId}|${stateObj.state}|${stateObj.last_changed}|${stateObj.last_updated}`;
+      })
+      .join("||");
+  }
+
+  _scheduleUpdate(delay = 0) {
+    if (!this._config || !this._hass) return;
+
+    if (this._updateTimer) {
+      clearTimeout(this._updateTimer);
+    }
+
+    this._updateTimer = setTimeout(() => {
+      this._updateTimer = null;
+      this._update();
+    }, delay);
+  }
+
   async _update() {
+    const requestId = ++this._updateRequestId;
+
     const missing = this._config.entities.filter((entityId) => !this._hass?.states?.[entityId]);
     if (missing.length > 0) {
+      if (requestId !== this._updateRequestId) return;
+      this._clearChart();
       this._setStatus(`Entity not found: ${missing.join(", ")}`);
       return;
     }
 
-    const datasets = await this._loadDatasets();
-    if (!datasets.length) {
-      this._setStatus("No numeric history data available for selected entities.");
-      return;
-    }
+    this._setStatus("Loading history…");
 
-    this._setStatus("");
-    await this._ensureChartJs();
-    this._renderChart(datasets);
+    try {
+      const datasets = await this._loadDatasets();
+
+      if (requestId !== this._updateRequestId) return;
+
+      if (!datasets.length) {
+        this._clearChart();
+        this._setStatus("No numeric history data available for selected entities.");
+        return;
+      }
+
+      await this._ensureChartJs();
+
+      if (requestId !== this._updateRequestId) return;
+
+      this._setStatus("");
+      this._renderChart(datasets);
+    } catch (error) {
+      if (requestId !== this._updateRequestId) return;
+      this._clearChart();
+      this._setStatus("Failed to load chart data.");
+      // eslint-disable-next-line no-console
+      console.error("ha-chart-design-card: update failed", error);
+    }
+  }
+
+  _clearChart() {
+    if (this._chart) {
+      this._chart.destroy();
+      this._chart = null;
+    }
   }
 
   async _loadDatasets() {
@@ -187,23 +294,28 @@ class HaChartDesignCard extends HTMLElement {
       this._config.entities.map(async (entityId, index) => {
         const stateObj = this._hass.states[entityId];
         const history = await this._fetchHistory(entityId);
+
         const points = history
           .map((entry) => {
             const value = Number.parseFloat(entry.state);
-            if (Number.isNaN(value)) return null;
+            const timestamp = new Date(entry.last_changed).getTime();
+
+            if (Number.isNaN(value) || !Number.isFinite(timestamp)) return null;
+
             return {
-              x: new Date(entry.last_changed).getTime(),
+              x: timestamp,
               y: value
             };
           })
           .filter(Boolean)
+          .sort((a, b) => a.x - b.x)
           .slice(-this._config.max_samples);
 
         if (!points.length) return null;
 
         const baseColor = this._config.colors[index] || DEFAULT_COLORS[index % DEFAULT_COLORS.length];
-        const displayName = stateObj.attributes.friendly_name || entityId;
-        const unit = stateObj.attributes.unit_of_measurement || "";
+        const displayName = stateObj.attributes?.friendly_name || entityId;
+        const unit = stateObj.attributes?.unit_of_measurement || "";
 
         return { entityId, displayName, unit, baseColor, points };
       })
@@ -216,7 +328,8 @@ class HaChartDesignCard extends HTMLElement {
     const endTime = new Date();
     const startTime = new Date(endTime.getTime() - this._config.hours_to_show * 60 * 60 * 1000);
 
-    const path = `history/period/${encodeURIComponent(startTime.toISOString())}` +
+    const path =
+      `history/period/${encodeURIComponent(startTime.toISOString())}` +
       `?filter_entity_id=${encodeURIComponent(entityId)}` +
       `&end_time=${encodeURIComponent(endTime.toISOString())}` +
       "&minimal_response";
@@ -225,7 +338,6 @@ class HaChartDesignCard extends HTMLElement {
       const result = await this._hass.callApi("GET", path);
       return Array.isArray(result?.[0]) ? result[0] : [];
     } catch (err) {
-      // Keep detailed fetch errors in console for easier debugging.
       // eslint-disable-next-line no-console
       console.error(`ha-chart-design-card: Failed to fetch history for ${entityId}`, err);
       return [];
@@ -235,48 +347,73 @@ class HaChartDesignCard extends HTMLElement {
   async _ensureChartJs() {
     if (window.Chart) return;
 
-    if (!this._chartPromise) {
-      this._chartPromise = new Promise((resolve, reject) => {
+    if (!CHART_JS_LOAD_PROMISE) {
+      CHART_JS_LOAD_PROMISE = new Promise((resolve, reject) => {
+        const existingScript = document.querySelector('script[data-ha-chart-design-chartjs="1"]');
+
+        if (existingScript) {
+          existingScript.addEventListener("load", () => resolve(), { once: true });
+          existingScript.addEventListener("error", () => reject(new Error("Failed to load Chart.js")), { once: true });
+          return;
+        }
+
         const script = document.createElement("script");
         script.src = "https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js";
+        script.dataset.haChartDesignChartjs = "1";
         script.onload = () => resolve();
         script.onerror = () => reject(new Error("Failed to load Chart.js"));
         document.head.appendChild(script);
       });
     }
 
-    await this._chartPromise;
+    await CHART_JS_LOAD_PROMISE;
   }
 
   _renderSkeleton() {
+    if (!this._config || !this.shadowRoot) return;
+
     this.shadowRoot.innerHTML = `
-      <ha-card header="${this._config.title}">
+      <ha-card header="${escapeAttribute(this._config.title)}">
         <div class="container">
-          <canvas id="chart"></canvas>
+          <div class="chart-wrap">
+            <canvas id="chart"></canvas>
+          </div>
           <div id="status" class="status"></div>
         </div>
       </ha-card>
       <style>
+        :host {
+          display: block;
+        }
+
         ha-card {
           background: linear-gradient(145deg, rgba(255, 162, 15, 0.16), rgba(255, 152, 0, 0.06));
           border-radius: 16px;
+          overflow: hidden;
         }
 
         .container {
           padding: 16px;
+        }
+
+        .chart-wrap {
           position: relative;
+          height: 300px;
           min-height: 300px;
+          max-height: 300px;
         }
 
         canvas {
-          width: 100%;
-          height: 280px;
+          display: block;
+          width: 100% !important;
+          height: 100% !important;
         }
 
         .status {
           margin-top: 10px;
           color: var(--secondary-text-color);
           font-size: 13px;
+          min-height: 18px;
         }
       </style>
     `;
@@ -285,6 +422,8 @@ class HaChartDesignCard extends HTMLElement {
   }
 
   _renderChart(seriesList) {
+    if (!this._canvas || !window.Chart) return;
+
     const thresholds = this._config.thresholds;
 
     const datasets = seriesList.map((series) => ({
@@ -292,11 +431,13 @@ class HaChartDesignCard extends HTMLElement {
       data: series.points,
       parsing: false,
       borderColor: series.baseColor,
-      backgroundColor: this._config.fill ? `${series.baseColor}44` : series.baseColor,
+      backgroundColor: this._config.fill ? `${series.baseColor}33` : series.baseColor,
       fill: this._config.fill,
       borderWidth: this._config.line_width,
       pointRadius: 0,
+      pointHoverRadius: 3,
       tension: 0.25,
+      spanGaps: true,
       segment: thresholds.length
         ? {
             borderColor: (ctx) => {
@@ -311,16 +452,10 @@ class HaChartDesignCard extends HTMLElement {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      scales: {
-        x: {
-          type: "linear",
-          ticks: {
-            maxRotation: 0,
-            autoSkip: true,
-            maxTicksLimit: 8,
-            callback: (value) => formatTimestampLabel(value)
-          }
-        }
+      normalized: true,
+      interaction: {
+        mode: "nearest",
+        intersect: false
       },
       plugins: {
         legend: {
@@ -338,43 +473,180 @@ class HaChartDesignCard extends HTMLElement {
             }
           }
         }
+      },
+      scales: {
+        x: {
+          type: "linear",
+          ticks: {
+            maxRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 8,
+            callback: (value) => formatTimestampLabel(value)
+          }
+        },
+        y: {
+          ticks: {
+            callback: (value) => `${value}`
+          }
+        }
       }
     };
 
     if (this._chart) {
-      this._chart.destroy();
+      this._chart.data = { datasets };
+      this._chart.options = options;
+      this._chart.update("none");
+      return;
     }
 
-    this._chart = new window.Chart(this._canvas, { type: "line", data: { datasets }, options });
+    this._chart = new window.Chart(this._canvas.getContext("2d"), {
+      type: "line",
+      data: { datasets },
+      options
+    });
   }
 
   _setStatus(text) {
     const statusEl = this.shadowRoot?.getElementById("status");
     if (statusEl) {
-      statusEl.textContent = text;
+      statusEl.textContent = text || "";
     }
   }
 }
 
 class HaChartDesignCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._config = null;
+    this._hass = null;
+    this._focusState = null;
+    this._scrollState = null;
+    this._lastInteractedField = null;
+  }
+
+  _configsEqual(leftConfig, rightConfig) {
+    if (leftConfig === rightConfig) return true;
+    if (!leftConfig || !rightConfig) return false;
+
+    try {
+      return JSON.stringify(leftConfig) === JSON.stringify(rightConfig);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  _findScrollContainer() {
+    let current = this.parentElement;
+
+    while (current) {
+      const style = window.getComputedStyle(current);
+      const canScroll =
+        /(auto|scroll)/.test(style.overflowY || "") && current.scrollHeight > current.clientHeight;
+
+      if (canScroll) {
+        return current;
+      }
+
+      current = current.parentElement;
+    }
+
+    return null;
+  }
+
+  _captureScrollState() {
+    const container = this._findScrollContainer();
+    this._scrollState = container
+      ? { type: "element", element: container, top: container.scrollTop }
+      : { type: "window", top: window.scrollY };
+  }
+
+  _restoreScrollState() {
+    if (!this._scrollState) return;
+
+    requestAnimationFrame(() => {
+      if (this._scrollState.type === "element" && this._scrollState.element) {
+        this._scrollState.element.scrollTop = this._scrollState.top;
+        return;
+      }
+
+      window.scrollTo({ top: this._scrollState.top, behavior: "auto" });
+    });
+  }
+
+  _captureFocusState(sourceElement = null) {
+    const activeElement =
+      sourceElement ||
+      this.shadowRoot.querySelector("input:focus, textarea:focus, select:focus");
+
+    if (!activeElement) {
+      this._focusState = null;
+      return;
+    }
+
+    const tagName = activeElement.tagName?.toLowerCase?.() || "";
+    const inputType = activeElement.type || "";
+    const shouldRestoreFocus =
+      tagName === "textarea" ||
+      tagName === "select" ||
+      (tagName === "input" && inputType !== "checkbox" && inputType !== "radio");
+
+    if (!shouldRestoreFocus) {
+      this._focusState = null;
+      return;
+    }
+
+    this._focusState = {
+      selector: `${tagName}[data-key="${activeElement.dataset?.key || ""}"]`,
+      selectionStart:
+        typeof activeElement.selectionStart === "number" ? activeElement.selectionStart : null,
+      selectionEnd:
+        typeof activeElement.selectionEnd === "number" ? activeElement.selectionEnd : null
+    };
+  }
+
+  _restoreFocusState() {
+    if (!this._focusState?.selector) return;
+
+    requestAnimationFrame(() => {
+      const target = this.shadowRoot.querySelector(this._focusState.selector);
+      if (!target) return;
+
+      target.focus();
+
+      if (
+        typeof target.setSelectionRange === "function" &&
+        this._focusState.selectionStart !== null &&
+        this._focusState.selectionEnd !== null
+      ) {
+        target.setSelectionRange(this._focusState.selectionStart, this._focusState.selectionEnd);
+      }
+    });
+  }
+
   setConfig(config) {
-    this._config = normalizeConfig(config || {});
+    const normalized = normalizeConfig(config || {});
+
+    if (this._configsEqual(this._config, normalized)) {
+      this._config = normalized;
+      return;
+    }
+
+    this._captureFocusState(this._lastInteractedField);
+    this._captureScrollState();
+    this._config = normalized;
     this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
-    this._render();
+    if (!this.shadowRoot.innerHTML && this._config) {
+      this._render();
+    }
   }
 
   _render() {
-    if (!this.shadowRoot) {
-      this.attachShadow({ mode: "open" });
-    }
-
-    if (!this._config) {
-      return;
-    }
+    if (!this._config || !this.shadowRoot) return;
 
     const entitiesText = this._config.entities.join("\n");
     const colorsText = (this._config.colors || []).join(", ");
@@ -382,8 +654,19 @@ class HaChartDesignCardEditor extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       <style>
-        .editor { display: grid; gap: 12px; padding: 12px 0; }
-        label { display: grid; gap: 6px; font-size: 14px; color: var(--primary-text-color); }
+        .editor {
+          display: grid;
+          gap: 12px;
+          padding: 12px 0;
+        }
+
+        label {
+          display: grid;
+          gap: 6px;
+          font-size: 14px;
+          color: var(--primary-text-color);
+        }
+
         input, textarea, select {
           font: inherit;
           padding: 8px;
@@ -391,26 +674,46 @@ class HaChartDesignCardEditor extends HTMLElement {
           border-radius: 8px;
           background: var(--card-background-color);
           color: var(--primary-text-color);
+          box-sizing: border-box;
+          width: 100%;
         }
-        textarea { min-height: 68px; resize: vertical; }
-        .hint { font-size: 12px; color: var(--secondary-text-color); }
-        .inline { display: flex; gap: 8px; align-items: center; }
+
+        textarea {
+          min-height: 68px;
+          resize: vertical;
+        }
+
+        .hint {
+          font-size: 12px;
+          color: var(--secondary-text-color);
+        }
+
+        .inline {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }
+
+        .inline input[type="checkbox"] {
+          width: auto;
+        }
       </style>
+
       <div class="editor">
         <label>
           Title
-          <input data-key="title" value="${this._config.title || ""}" />
+          <input data-key="title" value="${escapeAttribute(this._config.title || "")}" />
         </label>
 
         <label>
           Entities (one per line)
-          <textarea data-key="entities">${entitiesText}</textarea>
+          <textarea data-key="entities">${escapeHtml(entitiesText)}</textarea>
           <div class="hint">Examples: sensor.wohnzimmer_temperatur / sensor.kueche_luftfeuchte</div>
         </label>
 
         <label>
           Colors by entity (comma separated)
-          <input data-key="colors" value="${colorsText}" placeholder="#03a9f4, #ff7043" />
+          <input data-key="colors" value="${escapeAttribute(colorsText)}" placeholder="#03a9f4, #ff7043" />
           <div class="hint">Optional. If empty, default palette will be used.</div>
         </label>
 
@@ -426,23 +729,23 @@ class HaChartDesignCardEditor extends HTMLElement {
 
         <label>
           Threshold colors (one per line: value,color)
-          <textarea data-key="thresholds">${thresholdsText}</textarea>
+          <textarea data-key="thresholds">${escapeHtml(thresholdsText)}</textarea>
           <div class="hint">Manual thresholds override the selected preset.</div>
         </label>
 
         <label>
           Hours to show
-          <input data-key="hours_to_show" type="number" min="1" value="${this._config.hours_to_show}" />
+          <input data-key="hours_to_show" type="number" min="1" value="${escapeAttribute(this._config.hours_to_show)}" />
         </label>
 
         <label>
           Max samples per entity
-          <input data-key="max_samples" type="number" min="10" value="${this._config.max_samples}" />
+          <input data-key="max_samples" type="number" min="10" value="${escapeAttribute(this._config.max_samples)}" />
         </label>
 
         <label>
           Line width
-          <input data-key="line_width" type="number" min="1" max="8" value="${this._config.line_width}" />
+          <input data-key="line_width" type="number" min="1" max="8" value="${escapeAttribute(this._config.line_width)}" />
         </label>
 
         <label class="inline">
@@ -452,20 +755,36 @@ class HaChartDesignCardEditor extends HTMLElement {
       </div>
     `;
 
-    this.shadowRoot.querySelectorAll("input, textarea, select").forEach((el) => {
-      const eventName = el.tagName === "SELECT" || el.type === "checkbox" ? "change" : "input";
-      el.addEventListener(eventName, () => this._valueChanged(el));
+    this.shadowRoot.querySelectorAll("input[data-key], textarea[data-key]").forEach((el) => {
+      if (el.type === "checkbox") {
+        el.addEventListener("change", () => this._valueChanged(el));
+      } else {
+        el.addEventListener("change", () => this._valueChanged(el));
+      }
     });
+
+    this.shadowRoot.querySelectorAll("select[data-key]").forEach((el) => {
+      el.addEventListener("change", () => this._valueChanged(el));
+    });
+
+    this._restoreScrollState();
+    this._restoreFocusState();
   }
 
   _valueChanged(changedElement) {
+    if (!this._config || !this.shadowRoot) return;
+
+    this._lastInteractedField = changedElement;
+
     const get = (selector) => this.shadowRoot.querySelector(selector);
 
     const preset = get('[data-key="threshold_preset"]').value;
     const rawThresholds = get('[data-key="thresholds"]').value;
     const parsedManualThresholds = parseThresholdsFromText(rawThresholds);
 
-    const thresholds = parsedManualThresholds.length ? parsedManualThresholds : getPresetThresholds(preset);
+    const thresholds = parsedManualThresholds.length
+      ? parsedManualThresholds
+      : getPresetThresholds(preset);
 
     if (changedElement?.dataset?.key === "threshold_preset" && !parsedManualThresholds.length) {
       get('[data-key="thresholds"]').value = formatThresholdsForText(thresholds);
@@ -478,9 +797,9 @@ class HaChartDesignCardEditor extends HTMLElement {
       colors: parseEntityList(get('[data-key="colors"]').value),
       threshold_preset: preset,
       thresholds,
-      hours_to_show: Number.parseInt(get('[data-key="hours_to_show"]').value, 10) || 24,
-      max_samples: Number.parseInt(get('[data-key="max_samples"]').value, 10) || 200,
-      line_width: Number.parseInt(get('[data-key="line_width"]').value, 10) || 2,
+      hours_to_show: clampInt(get('[data-key="hours_to_show"]').value, 24, 1, 24 * 30),
+      max_samples: clampInt(get('[data-key="max_samples"]').value, 200, 10, 5000),
+      line_width: clampInt(get('[data-key="line_width"]').value, 2, 1, 8),
       fill: get('[data-key="fill"]').checked
     };
 
@@ -488,22 +807,34 @@ class HaChartDesignCardEditor extends HTMLElement {
 
     this._config = normalizeConfig(nextConfig);
 
-    this.dispatchEvent(new CustomEvent("config-changed", {
-      detail: { config: this._config },
-      bubbles: true,
-      composed: true
-    }));
+    this.dispatchEvent(
+      new CustomEvent("config-changed", {
+        detail: { config: this._config },
+        bubbles: true,
+        composed: true
+      })
+    );
   }
 }
 
-customElements.define("ha-chart-design-card", HaChartDesignCard);
-customElements.define("ha-chart-design-card-editor", HaChartDesignCardEditor);
+if (!customElements.get("ha-chart-design-card")) {
+  customElements.define("ha-chart-design-card", HaChartDesignCard);
+}
+
+if (!customElements.get("ha-chart-design-card-editor")) {
+  customElements.define("ha-chart-design-card-editor", HaChartDesignCardEditor);
+}
 
 window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "ha-chart-design-card",
+
+const haChartDesignCardRegistration = {
+  type: "custom:ha-chart-design-card",
   name: "HA Chart Design",
   preview: true,
   description: "Line chart card with multi-entity support and threshold color schemes",
   documentationURL: "https://github.com/404GamerNotFound/ha-chart-design"
-});
+};
+
+if (!window.customCards.some((entry) => entry.type === haChartDesignCardRegistration.type)) {
+  window.customCards.push(haChartDesignCardRegistration);
+}
